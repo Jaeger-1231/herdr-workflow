@@ -1,0 +1,4 @@
+interface:
+  display_name: "Herdr Coding Workflow"
+  short_description: "Coordinate planner, coder, and reviewer agents"
+  default_prompt: "Use $herdr-workflow to coordinate a planner, coder, and reviewer through an implementation and review loop."
