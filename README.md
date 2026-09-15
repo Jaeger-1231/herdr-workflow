@@ -13,7 +13,7 @@
 - 使用共享文件传递目标、诊断和审查结果；
 - 以实际 diff、测试命令和输出作为完成证据；
 - 只在持续失败时启动 debugger，避免无意义的额外调用；
-- 使用 Herdr 的生命周期等待能力，并为 coder 长任务提供每 8 分钟一次的结构化进度；
+- 使用 Herdr 的生命周期等待能力，并提供低开销静默等待与每 8 分钟进度两种模式；
 - 只在最终审查通过后执行经过明确授权的 Git 交付；
 - 限制修复循环次数，避免 Agent 在同一问题上无限往返。
 
@@ -42,7 +42,7 @@ test "${HERDR_ENV:-}" = 1
 ```mermaid
 flowchart TD
     P["Planner 制定计划"] --> C["Coder 实现并测试"]
-    C -. "每 8 分钟进度" .-> P
+    C -. "可选：每 8 分钟进度" .-> P
     C --> T{"相关检查通过？"}
     T -- "是" --> R["Reviewer 独立审查"]
     T -- "否，先直接修复" --> C
@@ -58,7 +58,7 @@ flowchart TD
 正常路径是：
 
 ```text
-planner → coder（每 8 分钟进度）→ reviewer → Git delivery gate → planner
+planner → 选择进度模式 → coder → reviewer → Git delivery gate → planner
 ```
 
 debugger 不在正常路径中。它只在满足触发条件时介入：
@@ -71,8 +71,8 @@ coder 持续失败 → debugger 诊断 → coder 修复 → reviewer
 
 | 角色 | 主要职责 | 是否修改业务代码 |
 |---|---|---:|
-| `planner` | 检查仓库、编写计划、分派任务、展示 coder 进度、判断修复或调试分支、执行授权的 Git 交付、汇总结果 | 原则上不修改业务代码 |
-| `coder` | 根据计划实现功能、修改测试、运行检查、维护进度文件并报告证据 | 是 |
+| `planner` | 检查仓库、询问进度模式、编写计划、分派任务、按模式展示进度、判断修复或调试分支、执行授权的 Git 交付、汇总结果 | 原则上不修改业务代码 |
+| `coder` | 根据计划实现功能、修改测试、运行检查，并在 `progress-8m` 模式下维护进度文件 | 是 |
 | `reviewer` | 检查计划、diff、测试证据和行为，输出结构化审查结论 | 否 |
 | `debugger` | 对持续失败进行根因诊断，提出最小修复和验证方法 | 否 |
 
@@ -106,13 +106,14 @@ coder 持续失败 → debugger 诊断 → coder 修复 → reviewer
 5. 实现步骤；
 6. 验证步骤；
 7. 尚未解决的假设或问题；
-8. Git delivery 模式、remote 和目标分支。
+8. coder 进度模式：`quiet` 或 `progress-8m`；
+9. Git delivery 模式、remote 和目标分支。
 
 coder、debugger 和 reviewer 都应以该文件作为任务范围依据。
 
 ### PROGRESS.md
 
-由 coder 在每个工作阶段开始时创建并持续覆盖更新。每条检查点包含：
+仅在 `progress-8m` 模式下，由 coder 在每个工作阶段开始时创建并持续覆盖更新。每条检查点包含：
 
 1. 时间戳；
 2. 自上次检查点以来已完成的工作；
@@ -121,7 +122,7 @@ coder、debugger 和 reviewer 都应以该文件作为任务范围依据。
 5. 阻塞或待决策事项；
 6. 最近一条相关命令及结果。
 
-coder 活跃期间，检查点间隔不应超过 8 分钟。长时间前台命令可能推迟更新；下一条检查点必须注明该命令及结果。
+coder 活跃期间，检查点间隔不应超过 8 分钟。长时间前台命令可能推迟更新；下一条检查点必须注明该命令及结果。`quiet` 模式不要求周期性检查点。
 
 ### DEBUG.md
 
@@ -178,7 +179,26 @@ planner 检查：
 
 然后写入 `.herdr/PLAN.md`。
 
-### 2. Coder 实现和验证
+### 2. 选择 coder 进度模式
+
+在第一次派发 coder 之前，planner 必须主动询问用户，除非用户已经在当前请求中明确选择：
+
+- `quiet`（默认、推荐）：不做周期汇报；coder settled 或 blocked 后才恢复 planner；
+- `progress-8m`：coder 活跃期间，每 8 分钟向用户展示一次结构化进度。
+
+选择结果写入 `.herdr/PLAN.md`。后续 coder 修复任务沿用该模式，除非用户主动切换。询问完成以前不得派发 coder。
+
+### 3. Coder 实现和验证
+
+`quiet` 模式使用：
+
+```bash
+herdr agent prompt coder \
+  "Read .herdr/PLAN.md. Implement the requested change, run the relevant checks, and report exact final evidence. Do not dispatch other agents." \
+  --wait
+```
+
+`progress-8m` 模式使用：
 
 planner 使用一次带 `--wait` 的提示提交任务：
 
@@ -190,7 +210,7 @@ herdr agent prompt coder \
 
 coder 必须报告实际执行的命令及结果，不能只声明“已经完成”。
 
-### 3. 每 8 分钟进度
+### 4. `progress-8m` 进度
 
 如果 coder 在 480 秒内尚未结束，timeout 只结束当前等待，不会终止 coder。planner 读取一次 `.herdr/PROGRESS.md`，向用户展示：
 
@@ -207,7 +227,9 @@ herdr agent wait coder --timeout 480000
 
 只要 coder 仍在工作，就重复这一窗口。不要额外立即执行 `agent get`。如果没有新的结构化检查点，planner 必须明确说明，而不能猜测进度；必要时只读取一次可见输出，并要求 coder 在下一个安全边界更新文件。
 
-### 4. Reviewer 独立审查
+`quiet` 模式跳过本节，不读取 `.herdr/PROGRESS.md`，也不为进度报告唤醒 planner。
+
+### 5. Reviewer 独立审查
 
 相关检查通过后，planner 提交 reviewer：
 
@@ -249,9 +271,9 @@ planner 检查 `.herdr/DEBUG.md` 是否提供了可验证的诊断，然后只�
 
 ## 等待与额度优化
 
-Herdr 的 `agent prompt --wait` 会提交提示并等待目标进入 `idle`、`done` 或 `blocked`。reviewer 和 debugger 使用单次等待，不建立轮询循环。coder 为满足用户可见进度要求，单独使用 480 秒检查点窗口。
+Herdr 的 `agent prompt --wait` 会提交提示并等待目标进入 `idle`、`done` 或 `blocked`。reviewer、debugger 和 `quiet` coder 使用单次等待，不建立轮询循环。只有 `progress-8m` coder 使用 480 秒检查点窗口。
 
-除 coder 的显式进度协议外：
+除 `progress-8m` 的显式进度协议外：
 
 - 每项任务只提交一次 `agent prompt --wait`；
 - 不在提交后立即追加 `agent get`；
@@ -261,7 +283,7 @@ Herdr 的 `agent prompt --wait` 会提交提示并等待目标进入 `idle`、`d
 - 使用 `agent prompt --wait` 返回的生命周期状态；
 - 完成后只收集一次必要的语义结果。
 
-coder 的 480 秒 timeout 是计划内的进度检查点，不属于基础设施错误。该功能会增加 planner 和 coder 的模型调用，只应用于 coder。
+`progress-8m` 的 480 秒 timeout 是计划内的进度检查点，不属于基础设施错误。该模式会增加 planner 和 coder 的模型调用；`quiet` 模式没有这项周期性开销。
 
 优先读取 handoff 文件。如果结果只存在于终端 transcript 中，再执行一次大小合适的 `agent read`，不要同时追加冗余状态查询。
 
