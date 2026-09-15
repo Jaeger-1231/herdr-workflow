@@ -88,6 +88,16 @@ The normal sequence is:
 
 `agent prompt --wait` tracks Herdr lifecycle state, not the semantic correctness of the work. Always inspect the final diff and test evidence before reporting completion.
 
+### Reliable submission and continuation
+
+Treat prompt submission and workflow continuation as planner-owned responsibilities. Herdr does not automatically wake a planner after a later agent completion.
+
+After `agent prompt`, immediately inspect `agent get` and a short `agent read`. If the target remains `idle` and the task text is visibly sitting in its input box, send logical key `enter` exactly once, then confirm that the state becomes `working` or `blocked`. Do not send another Enter when the agent is already working.
+
+Keep the planner turn active while an agent works by waiting in bounded intervals no longer than 60 seconds and sharing concise progress updates. When a wait returns `blocked`, inspect the UI. If the user must answer an approval or question, record which agent and handoff stage are pending. On the next user turn, inspect that agent first and resume the same wait; do not assume a completion notification will restart the planner automatically.
+
+When the agent becomes `idle` or `done`, read its final output and required handoff artifact immediately. A coder is complete only when its implementation and test evidence are available; then dispatch the reviewer in the same planner workflow. Apply the same submission check and bounded-wait loop to the reviewer.
+
 ## Shared-state safety
 
 - Run coder and reviewer sequentially; do not let both modify the same source files concurrently.
