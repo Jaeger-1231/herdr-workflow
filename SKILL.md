@@ -150,6 +150,18 @@ A progress checkpoint is informational. It must not be treated as task completio
 
 `agent prompt --wait` tracks Herdr lifecycle state, not the semantic correctness of the work. Always inspect the final diff and test evidence before reporting completion.
 
+### Planner continuation invariant
+
+After dispatching another agent, the planner must keep the current orchestration turn open until that agent settles and the next handoff has been processed. A Herdr completion notification can update terminal or UI state, but it does not by itself create a new planner model turn.
+
+1. Prefer a foreground `herdr agent prompt <name> ... --wait` call. If the prompt was already submitted, use a foreground `herdr agent wait <name>` call instead.
+2. Do not detach the Herdr wait, launch it with shell backgrounding, or end the planner turn while expecting a later notification to resume reasoning.
+3. If the planner's execution host yields a session or task handle for a long-running foreground command, use that host's supported wait/resume operation on the same handle. Tool names differ between hosts; do not assume that a command such as `WaitFor` exists.
+4. If a host-level wait times out while the Herdr command is still running, resume waiting on the same command or agent. Do not resubmit the task.
+5. When the target settles, read the required handoff once and continue immediately in the same planner turn: coder result to reviewer, reviewer findings to coder, or final `PASS` to the delivery gate.
+
+The planner may end the turn before the workflow settles only when the target is genuinely blocked on user input or authorization, the user requested manual pacing, or the host cannot maintain a blocking wait. In that case, report the exact pending agent and handoff stage instead of claiming automatic continuation.
+
 ### Efficient waiting and recovery
 
 For reviewer and debugger tasks, treat a successful `agent prompt --wait` call as the normal synchronization boundary. Herdr submits the prompt with Enter and waits for a settled lifecycle state, so the planner should not build a polling loop around those roles. Coder tasks use only the explicit eight-minute progress windows above.
