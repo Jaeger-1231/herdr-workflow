@@ -1,4 +1,4 @@
 interface:
   display_name: "Herdr Coding Workflow"
-  short_description: "Coordinate coding, progress, review, and Git delivery"
-  default_prompt: "Use $herdr-workflow to coordinate planning, eight-minute coder progress, conditional debugging, review, and authorized Git delivery."
+  short_description: "Coordinate coding, selectable progress, review, and Git"
+  default_prompt: "Use $herdr-workflow to coordinate planning, ask me to choose quiet or progress-8m mode before coding, then handle conditional debugging, review, and authorized Git delivery."
