@@ -13,7 +13,8 @@
 - 使用共享文件传递目标、诊断和审查结果；
 - 以实际 diff、测试命令和输出作为完成证据；
 - 只在持续失败时启动 debugger，避免无意义的额外调用；
-- 使用 Herdr 的生命周期等待能力，减少 planner 的轮询和模型消耗；
+- 使用 Herdr 的生命周期等待能力，并提供低开销静默等待与每 8 分钟进度两种模式；
+- 只在最终审查通过后执行经过明确授权的 Git 交付；
 - 限制修复循环次数，避免 Agent 在同一问题上无限往返。
 
 工作流不绑定模型或提供商。启动 Agent 时使用哪种 CLI、模型和推理强度，由用户根据任务、额度和可用环境决定。
@@ -41,6 +42,7 @@ test "${HERDR_ENV:-}" = 1
 ```mermaid
 flowchart TD
     P["Planner 制定计划"] --> C["Coder 实现并测试"]
+    C -. "可选：每 8 分钟进度" .-> P
     C --> T{"相关检查通过？"}
     T -- "是" --> R["Reviewer 独立审查"]
     T -- "否，先直接修复" --> C
@@ -48,14 +50,15 @@ flowchart TD
     D --> F["Coder 按诊断修复"]
     F --> T
     R --> S{"审查状态"}
-    S -- "PASS" --> E["Planner 汇总"]
     S -- "FIX_REQUIRED" --> C
+    S -- "PASS" --> G{"Git delivery"}
+    G --> E["Planner 汇总"]
 ```
 
 正常路径是：
 
 ```text
-planner → coder → reviewer → planner
+planner → 选择进度模式 → coder → reviewer → Git delivery gate → planner
 ```
 
 debugger 不在正常路径中。它只在满足触发条件时介入：
@@ -68,8 +71,8 @@ coder 持续失败 → debugger 诊断 → coder 修复 → reviewer
 
 | 角色 | 主要职责 | 是否修改业务代码 |
 |---|---|---:|
-| `planner` | 检查仓库、编写计划、分派任务、判断是否进入修复或调试分支、汇总结果 | 原则上不修改 |
-| `coder` | 根据计划实现功能、修改测试、运行检查并报告证据 | 是 |
+| `planner` | 检查仓库、询问进度模式、编写计划、分派任务、按模式展示进度、判断修复或调试分支、执行授权的 Git 交付、汇总结果 | 原则上不修改业务代码 |
+| `coder` | 根据计划实现功能、修改测试、运行检查，并在 `progress-8m` 模式下维护进度文件 | 是 |
 | `reviewer` | 检查计划、diff、测试证据和行为，输出结构化审查结论 | 否 |
 | `debugger` | 对持续失败进行根因诊断，提出最小修复和验证方法 | 否 |
 
@@ -82,11 +85,13 @@ coder 持续失败 → debugger 诊断 → coder 修复 → reviewer
 ```text
 .herdr/
 ├── PLAN.md
+├── PROGRESS.md
 ├── DEBUG.md
-└── REVIEW.md
+├── REVIEW.md
+└── PUBLISH.md
 ```
 
-`DEBUG.md` 仅在条件式调试被触发时出现。
+`DEBUG.md` 仅在条件式调试被触发时出现；`PUBLISH.md` 仅在 Git 交付成功后出现。
 
 除非用户明确要求，否则不要修改项目的 `.gitignore` 或其他仓库配置来处理这些文件。
 
@@ -100,9 +105,24 @@ coder 持续失败 → debugger 诊断 → coder 修复 → reviewer
 4. 预计修改的文件或组件；
 5. 实现步骤；
 6. 验证步骤；
-7. 尚未解决的假设或问题。
+7. 尚未解决的假设或问题；
+8. coder 进度模式：`quiet` 或 `progress-8m`；
+9. Git delivery 模式、remote 和目标分支。
 
 coder、debugger 和 reviewer 都应以该文件作为任务范围依据。
+
+### PROGRESS.md
+
+仅在 `progress-8m` 模式下，由 coder 在每个工作阶段开始时创建并持续覆盖更新。每条检查点包含：
+
+1. 时间戳；
+2. 自上次检查点以来已完成的工作；
+3. 当前正在解决的问题；
+4. 下一步计划；
+5. 阻塞或待决策事项；
+6. 最近一条相关命令及结果。
+
+coder 活跃期间，检查点间隔不应超过 8 分钟。长时间前台命令可能推迟更新；下一条检查点必须注明该命令及结果。`quiet` 模式不要求周期性检查点。
 
 ### DEBUG.md
 
@@ -117,6 +137,10 @@ coder、debugger 和 reviewer 都应以该文件作为任务范围依据。
 7. 用于确认或否定诊断的验证方法。
 
 debugger 只提供诊断，不直接修改源代码或测试。coder 负责实施修复。
+
+### PUBLISH.md
+
+Git 交付成功后由 planner 创建，记录 delivery mode、remote、branch、完整 commit SHA、push 结果、PR 链接以及用于批准交付的测试和 review 状态。
 
 ### REVIEW.md
 
@@ -155,19 +179,57 @@ planner 检查：
 
 然后写入 `.herdr/PLAN.md`。
 
-### 2. Coder 实现和验证
+### 2. 选择 coder 进度模式
+
+在第一次派发 coder 之前，planner 必须主动询问用户，除非用户已经在当前请求中明确选择：
+
+- `quiet`（默认、推荐）：不做周期汇报；coder settled 或 blocked 后才恢复 planner；
+- `progress-8m`：coder 活跃期间，每 8 分钟向用户展示一次结构化进度。
+
+选择结果写入 `.herdr/PLAN.md`。后续 coder 修复任务沿用该模式，除非用户主动切换。询问完成以前不得派发 coder。
+
+### 3. Coder 实现和验证
+
+`quiet` 模式使用：
+
+```bash
+herdr agent prompt coder \
+  "Read .herdr/PLAN.md. Implement the requested change, run the relevant checks, and report exact final evidence. Do not dispatch other agents." \
+  --wait
+```
+
+`progress-8m` 模式使用：
 
 planner 使用一次带 `--wait` 的提示提交任务：
 
 ```bash
 herdr agent prompt coder \
-  "Read .herdr/PLAN.md. Implement the requested change, run the relevant checks, and report exact evidence. Do not dispatch other agents." \
-  --wait
+  "Read .herdr/PLAN.md. Implement the requested change and run the relevant checks. Maintain .herdr/PROGRESS.md with a timestamp, completed work, current problem, next action, blockers, and the latest relevant command/result; refresh it at material phase changes and at least every eight minutes while active. Report exact final evidence. Do not dispatch other agents." \
+  --wait --timeout 480000
 ```
 
 coder 必须报告实际执行的命令及结果，不能只声明“已经完成”。
 
-### 3. Reviewer 独立审查
+### 4. `progress-8m` 进度
+
+如果 coder 在 480 秒内尚未结束，timeout 只结束当前等待，不会终止 coder。planner 读取一次 `.herdr/PROGRESS.md`，向用户展示：
+
+- 已完成；
+- 正在解决；
+- 下一步；
+- 阻塞。
+
+展示后，planner 在同一编排过程中继续：
+
+```bash
+herdr agent wait coder --timeout 480000
+```
+
+只要 coder 仍在工作，就重复这一窗口。不要额外立即执行 `agent get`。如果没有新的结构化检查点，planner 必须明确说明，而不能猜测进度；必要时只读取一次可见输出，并要求 coder 在下一个安全边界更新文件。
+
+`quiet` 模式跳过本节，不读取 `.herdr/PROGRESS.md`，也不为进度报告唤醒 planner。
+
+### 5. Reviewer 独立审查
 
 相关检查通过后，planner 提交 reviewer：
 
@@ -209,20 +271,33 @@ planner 检查 `.herdr/DEBUG.md` 是否提供了可验证的诊断，然后只�
 
 ## 等待与额度优化
 
-Herdr 的 `agent prompt --wait` 会提交提示并等待目标进入 `idle`、`done` 或 `blocked`。正常情况下，planner 不需要围绕它建立轮询循环。
+Herdr 的 `agent prompt --wait` 会提交提示并等待目标进入 `idle`、`done` 或 `blocked`。reviewer、debugger 和 `quiet` coder 使用单次等待，不建立轮询循环。只有 `progress-8m` coder 使用 480 秒检查点窗口。
 
-正常路径遵守以下规则：
+除 `progress-8m` 的显式进度协议外：
 
 - 每项任务只提交一次 `agent prompt --wait`；
 - 不在提交后立即追加 `agent get`；
 - 不执行仅用于确认提交的短 `agent read`；
 - 不手动发送 Enter 作为常规兜底；
-- 不每隔固定时间轮询；
-- 不为了保持 planner 活跃而周期性生成进度消息；
+- 不为了保持 planner 活跃而产生额外轮询；
 - 使用 `agent prompt --wait` 返回的生命周期状态；
 - 完成后只收集一次必要的语义结果。
 
+`progress-8m` 的 480 秒 timeout 是计划内的进度检查点，不属于基础设施错误。该模式会增加 planner 和 coder 的模型调用；`quiet` 模式没有这项周期性开销。
+
 优先读取 handoff 文件。如果结果只存在于终端 transcript 中，再执行一次大小合适的 `agent read`，不要同时追加冗余状态查询。
+
+### Planner 自动续接
+
+派发任务后，planner 必须保持当前编排回合，直到目标 Agent 进入 settled 状态并处理完下一次 handoff。Herdr 的完成通知可以更新终端或界面状态，但不会自动创建一个新的 planner 模型回合。
+
+- 首选以前台方式执行 `herdr agent prompt <name> ... --wait`；提示已经提交时，改用前台 `herdr agent wait <name>`。
+- 不要把 wait 放到 shell 后台、启动后立即结束 planner 回合，或依赖用户再发消息来唤醒流程。
+- 如果 planner 所在的执行环境为长命令返回 session/task handle，应使用该环境提供的 wait/resume 能力继续等待同一 handle。不同 CLI 的工具名不同，不能把 `WaitFor` 等私有工具名写成通用要求。
+- 宿主等待超时时，只继续等待同一命令或 Agent，不重新提交原任务。
+- coder settled 后立即进入 reviewer；reviewer settled 后立即处理 `FIX_REQUIRED` 或 `PASS`，都在同一个 planner 回合中完成。
+
+只有 Agent 确实需要用户输入或授权、用户选择手动节奏，或者宿主无法维持阻塞等待时，planner 才可以提前结束回合。此时必须明确报告等待中的 Agent 和 handoff 阶段。
 
 ### 异常恢复
 
@@ -240,6 +315,33 @@ Herdr 的 `agent prompt --wait` 会提交提示并等待目标进入 `idle`、`d
 - 如果任务确实不存在且 Agent 已准备好，最多重新提交一次；
 - 不盲目补发 Enter；
 - 重复失败时停止并报告现场状态。
+
+## Git 交付
+
+Git 操作位于最终 `PASS` 之后，由 planner 执行，不增加新的 Agent。
+
+在编码前将以下模式之一写入 `.herdr/PLAN.md`：
+
+| 模式 | 行为 |
+|---|---|
+| `no-push` | 不提交、不推送 |
+| `commit-only` | 创建本地 commit，不推送 |
+| `push-branch` | 提交并推送任务分支 |
+| `push-and-pr` | 推送任务分支并创建 PR |
+
+用户未明确授权时默认 `no-push`。普通的代码修改请求不自动包含远程推送权限。
+
+如果需要推送，应在编码前确认 remote、base 和任务分支。最终 review 为 `PASS` 且全部要求的检查通过后：
+
+1. 检查 `git status --short`、当前分支、remote、暂存区和任务 diff；
+2. 排除无关用户修改以及未被要求纳入版本控制的 `.herdr/` 文件；
+3. 只暂存本任务文件；
+4. 创建清晰 commit，并核对完整 SHA 和提交内容；
+5. 将任务分支推送到已确认的 remote，不使用 force；
+6. `push-and-pr` 模式下，在 push 成功后创建 PR；
+7. 把结果写入 `.herdr/PUBLISH.md`。
+
+存在 `FIX_REQUIRED`、测试失败、未解决的 debugger 诊断、分支或 remote 不明确、无法分离无关修改、缺少授权或需要改写历史时，停止交付并向用户说明。
 
 ## 状态与正确性
 
@@ -280,6 +382,7 @@ planner 最终应报告：
 - 每项验证的实际结果；
 - 最终 review 状态；
 - debugger 是否被触发及其结论；
+- Git delivery 模式、分支、完整 commit SHA、push 结果和 PR 链接；
 - 尚未解决的失败；
 - 与任务有关的假设或后续工作。
 
