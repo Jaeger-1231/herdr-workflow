@@ -71,7 +71,7 @@ The normal sequence is:
    ```bash
    herdr agent prompt coder \
      "Read .herdr/PLAN.md. Implement the requested change, run the relevant checks, and report exact evidence. Do not dispatch other agents." \
-     --wait --timeout 120000
+     --wait
    ```
 
 3. Planner prompts `reviewer` and waits:
@@ -79,7 +79,7 @@ The normal sequence is:
    ```bash
    herdr agent prompt reviewer \
      "Read .herdr/PLAN.md, inspect the current diff and test evidence, and write .herdr/REVIEW.md. Do not modify business code. The first non-empty line must be PASS or FIX_REQUIRED." \
-     --wait --timeout 120000
+     --wait
    ```
 
 4. Planner reads `.herdr/REVIEW.md`. If it says `FIX_REQUIRED`, it gives the findings to `coder`, waits for the fix and tests, then asks `reviewer` to review again.
@@ -88,15 +88,25 @@ The normal sequence is:
 
 `agent prompt --wait` tracks Herdr lifecycle state, not the semantic correctness of the work. Always inspect the final diff and test evidence before reporting completion.
 
-### Reliable submission and continuation
+### Efficient waiting and recovery
 
-Treat prompt submission and workflow continuation as planner-owned responsibilities. Herdr does not automatically wake a planner after a later agent completion.
+Treat a successful `agent prompt --wait` call as the normal synchronization boundary. Herdr submits the prompt with Enter and waits for the target to reach a settled lifecycle state, so the planner should not build a polling loop around it.
 
-After `agent prompt`, immediately inspect `agent get` and a short `agent read`. If the target remains `idle` and the task text is visibly sitting in its input box, send logical key `enter` exactly once, then confirm that the state becomes `working` or `blocked`. Do not send another Enter when the agent is already working.
+On the normal path:
 
-Keep the planner turn active while an agent works by waiting in bounded intervals no longer than 60 seconds and sharing concise progress updates. When a wait returns `blocked`, inspect the UI. If the user must answer an approval or question, record which agent and handoff stage are pending. On the next user turn, inspect that agent first and resume the same wait; do not assume a completion notification will restart the planner automatically.
+1. Submit the prompt once with `--wait`. Let the command remain pending until Herdr returns `idle`, `done`, or `blocked`. Add a timeout only when the user or execution environment requires a bounded wait.
+2. Use the state returned by `agent prompt --wait` directly. Do not immediately follow submission with `agent get` or a short `agent read` merely to verify that the prompt was accepted.
+3. Do not send Enter as a submission fallback, poll at fixed intervals, or produce periodic progress messages solely to keep the planner active.
+4. When the target reaches `idle` or `done`, collect its semantic result once. Prefer the required handoff artifact; if the result exists only in the transcript, perform one appropriately sized `agent read`. Do not pair that read with a redundant status query.
+5. When the target reaches `blocked`, inspect the blocking UI once and stop for any user decision or authorization that is required. Do not answer approvals or questions by guessing.
 
-When the agent becomes `idle` or `done`, read its final output and required handoff artifact immediately. A coder is complete only when its implementation and test evidence are available; then dispatch the reviewer in the same planner workflow. Apply the same submission check and bounded-wait loop to the reviewer.
+Use recovery checks only after an actual exceptional result:
+
+- `agent_prompt_stalled` or a timeout does not prove that the prompt was not submitted. Read the target once before retrying. If it is working, use one `agent wait` call for the settled state. If the task is absent and the agent is ready, resubmit the prompt once.
+- Never send Enter blindly after a stalled submission. If text is visibly left unsubmitted and Herdr cannot submit it reliably, report the infrastructure failure instead of adding repeated keystroke heuristics.
+- After repeated submission or lifecycle failures, stop and report the observed state rather than looping.
+
+Herdr lifecycle states are synchronization signals, not evidence of semantic correctness. Before reporting completion, verify the required handoff artifact, current diff, and test evidence.
 
 ## Shared-state safety
 
