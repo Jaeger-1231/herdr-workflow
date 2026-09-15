@@ -265,6 +265,18 @@ coder 的 480 秒 timeout 是计划内的进度检查点，不属于基础设施
 
 优先读取 handoff 文件。如果结果只存在于终端 transcript 中，再执行一次大小合适的 `agent read`，不要同时追加冗余状态查询。
 
+### Planner 自动续接
+
+派发任务后，planner 必须保持当前编排回合，直到目标 Agent 进入 settled 状态并处理完下一次 handoff。Herdr 的完成通知可以更新终端或界面状态，但不会自动创建一个新的 planner 模型回合。
+
+- 首选以前台方式执行 `herdr agent prompt <name> ... --wait`；提示已经提交时，改用前台 `herdr agent wait <name>`。
+- 不要把 wait 放到 shell 后台、启动后立即结束 planner 回合，或依赖用户再发消息来唤醒流程。
+- 如果 planner 所在的执行环境为长命令返回 session/task handle，应使用该环境提供的 wait/resume 能力继续等待同一 handle。不同 CLI 的工具名不同，不能把 `WaitFor` 等私有工具名写成通用要求。
+- 宿主等待超时时，只继续等待同一命令或 Agent，不重新提交原任务。
+- coder settled 后立即进入 reviewer；reviewer settled 后立即处理 `FIX_REQUIRED` 或 `PASS`，都在同一个 planner 回合中完成。
+
+只有 Agent 确实需要用户输入或授权、用户选择手动节奏，或者宿主无法维持阻塞等待时，planner 才可以提前结束回合。此时必须明确报告等待中的 Agent 和 handoff 阶段。
+
 ### 异常恢复
 
 仅在真实异常发生后进行恢复检查：
