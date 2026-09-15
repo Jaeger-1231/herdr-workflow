@@ -1,6 +1,6 @@
 ---
 name: herdr-workflow
-description: "Coordinate a sequential planner-coder-reviewer coding workflow with conditional debugging inside Herdr using shared handoff files, agent prompts, tests, and bounded fix loops. Use when the user explicitly asks to orchestrate multiple coding agents in one Herdr workspace."
+description: "Coordinate a sequential planner-coder-reviewer coding workflow with conditional debugging, eight-minute coder progress reports, and an optional reviewed Git delivery step inside Herdr. Use when the user explicitly asks to orchestrate multiple coding agents in one Herdr workspace."
 ---
 
 # Herdr coding workflow
@@ -23,8 +23,8 @@ Use the installed `/herdr` skill for Herdr command semantics. The workflow assum
 
 Every participating agent must be assigned one explicit role in its startup prompt or agent name:
 
-- `planner`: owns orchestration, creates the plan, dispatches the other agents, decides whether another loop is needed, and reports the final result. The planner may be a Codex agent with access to the `/herdr` skill.
-- `coder`: reads the plan, changes source and tests, runs the relevant checks, and reports evidence. It does not dispatch other agents or rewrite the plan unless the planner explicitly asks.
+- `planner`: owns orchestration, creates the plan, dispatches the other agents, decides whether another loop is needed, presents coder progress checkpoints to the user, performs any authorized Git delivery, and reports the final result. The planner may be a Codex agent with access to the `/herdr` skill.
+- `coder`: reads the plan, changes source and tests, runs the relevant checks, records structured progress checkpoints, and reports evidence. It does not dispatch other agents or rewrite the plan unless the planner explicitly asks.
 - `reviewer`: reviews the plan, diff, tests, and relevant behavior without changing business code. It writes a structured review result and identifies concrete fixes.
 - `debugger`: is started only when the conditional debugging branch is triggered. It diagnoses persistent failures and writes evidence-backed repair guidance without changing source code or tests.
 
@@ -40,7 +40,18 @@ The planner writes `.herdr/PLAN.md` before implementation. It should contain:
 2. repository findings and constraints;
 3. files or components expected to change;
 4. implementation and verification steps;
-5. unresolved assumptions or questions.
+5. unresolved assumptions or questions;
+6. the Git delivery mode, remote, and target branch when delivery is in scope.
+
+During every coder work period, the coder maintains `.herdr/PROGRESS.md`. Each checkpoint replaces the previous checkpoint and includes a timestamp plus:
+
+1. work completed since the previous checkpoint;
+2. the problem currently being solved;
+3. the next planned action;
+4. blockers or decisions needed;
+5. the most recent relevant command and result, when available.
+
+The coder writes an initial checkpoint when it starts and refreshes it at material phase changes. While it remains active, no more than eight minutes should pass between checkpoints. A long foreground command may delay a checkpoint; in that case the next checkpoint must identify the command and its outcome.
 
 The coder reads `.herdr/PLAN.md`, implements the requested change, runs the appropriate tests or checks, and leaves the working tree and test evidence available for review. It must not claim success without reporting the commands it ran and their outcomes.
 
@@ -53,6 +64,8 @@ When conditional debugging is triggered, the debugger reads `.herdr/PLAN.md`, th
 5. commands or observations that would confirm or falsify the diagnosis.
 
 The debugger must not modify source code or tests. The coder remains responsible for applying the diagnosis and running verification.
+
+When Git delivery succeeds, the planner writes `.herdr/PUBLISH.md` containing the selected delivery mode, remote, branch, full commit SHA, push result, pull-request URL when applicable, and the verification and review state used to authorize delivery.
 
 The reviewer reads `.herdr/PLAN.md`, the current diff, and the available test evidence. It writes `.herdr/REVIEW.md` with exactly one status on the first non-empty line:
 
@@ -77,13 +90,15 @@ Start agents with the model and provider arguments requested by the user. Herdr 
 The normal sequence is:
 
 1. Planner inspects the repository and writes `.herdr/PLAN.md`.
-2. Planner prompts `coder` and waits for a settled result:
+2. Planner prompts `coder` with the progress contract and starts the first eight-minute wait window:
 
    ```bash
    herdr agent prompt coder \
-     "Read .herdr/PLAN.md. Implement the requested change, run the relevant checks, and report exact evidence. Do not dispatch other agents." \
-     --wait
+     "Read .herdr/PLAN.md. Implement the requested change and run the relevant checks. Maintain .herdr/PROGRESS.md with a timestamp, completed work, current problem, next action, blockers, and the latest relevant command/result; refresh it at material phase changes and at least every eight minutes while active. Report exact final evidence. Do not dispatch other agents." \
+     --wait --timeout 480000
    ```
+
+   If the command times out while the coder is still working, the planner handles a progress checkpoint as described below and then continues with `agent wait coder --timeout 480000`. The timeout ends only the wait; it does not cancel the coder.
 
 3. Planner checks the coder's reported verification. If the relevant checks pass, it prompts `reviewer` and waits:
 
@@ -117,19 +132,37 @@ When triggered:
 
 Use at most one debugger-diagnosis/fix cycle by default. Do not alternate indefinitely between coder and debugger.
 
+### Eight-minute coder progress
+
+This is an intentional exception to the no-polling normal path and applies only while the coder is actively working. Use it for the initial implementation and for later coder repair tasks.
+
+At each 480-second timeout:
+
+1. Use the existing wait result to confirm that the coder has not settled; do not add an immediate `agent get`.
+2. Read `.herdr/PROGRESS.md` once.
+3. Present a concise user-facing update with the checkpoint timestamp and exactly these fields: completed, current problem, next action, and blockers.
+4. Resume waiting with one `herdr agent wait coder --timeout 480000` call in the same orchestration turn. Do not end the workflow or require a user reply unless a real decision is blocked.
+5. Repeat only while the coder remains active.
+
+If `.herdr/PROGRESS.md` is missing or older than the previous eight-minute window, do not invent progress. Report that no fresh structured checkpoint is available, read the coder's visible output once if needed, and ask the coder once to refresh the file at the next safe boundary without resubmitting the main task.
+
+A progress checkpoint is informational. It must not be treated as task completion, review evidence, or permission to perform Git delivery. This cadence deliberately adds model and orchestration work; do not apply it to reviewer or debugger waits unless the user explicitly asks.
+
 `agent prompt --wait` tracks Herdr lifecycle state, not the semantic correctness of the work. Always inspect the final diff and test evidence before reporting completion.
 
 ### Efficient waiting and recovery
 
-Treat a successful `agent prompt --wait` call as the normal synchronization boundary. Herdr submits the prompt with Enter and waits for the target to reach a settled lifecycle state, so the planner should not build a polling loop around it.
+For reviewer and debugger tasks, treat a successful `agent prompt --wait` call as the normal synchronization boundary. Herdr submits the prompt with Enter and waits for a settled lifecycle state, so the planner should not build a polling loop around those roles. Coder tasks use only the explicit eight-minute progress windows above.
 
-On the normal path:
+Outside the coder progress protocol:
 
 1. Submit the prompt once with `--wait`. Let the command remain pending until Herdr returns `idle`, `done`, or `blocked`. Add a timeout only when the user or execution environment requires a bounded wait.
 2. Use the state returned by `agent prompt --wait` directly. Do not immediately follow submission with `agent get` or a short `agent read` merely to verify that the prompt was accepted.
 3. Do not send Enter as a submission fallback, poll at fixed intervals, or produce periodic progress messages solely to keep the planner active.
 4. When the target reaches `idle` or `done`, collect its semantic result once. Prefer the required handoff artifact; if the result exists only in the transcript, perform one appropriately sized `agent read`. Do not pair that read with a redundant status query.
 5. When the target reaches `blocked`, inspect the blocking UI once and stop for any user decision or authorization that is required. Do not answer approvals or questions by guessing.
+
+A 480-second timeout produced by the coder progress protocol is a scheduled checkpoint, not an infrastructure error. Other timeouts use the recovery rules below.
 
 Use recovery checks only after an actual exceptional result:
 
@@ -138,6 +171,31 @@ Use recovery checks only after an actual exceptional result:
 - After repeated submission or lifecycle failures, stop and report the observed state rather than looping.
 
 Herdr lifecycle states are synchronization signals, not evidence of semantic correctness. Before reporting completion, verify the required handoff artifact, current diff, and test evidence.
+
+## Git delivery
+
+Git delivery is a post-review gate owned by the planner, not a separate agent role. Determine the delivery mode before implementation and record it in `.herdr/PLAN.md`:
+
+- `no-push`: do not create a commit or push;
+- `commit-only`: create a local commit but do not push;
+- `push-branch`: commit and push the current task branch;
+- `push-and-pr`: commit, push the task branch, and create a pull request when the available tools support it.
+
+If the user has not explicitly authorized a delivery mode, use `no-push`. A request to edit code does not by itself authorize a remote push.
+
+For a push mode, resolve the remote and branch before coding. Prefer a task branch created from the intended base before implementation. Do not push directly to the default or protected branch unless the user explicitly requested that exact target.
+
+Run the delivery gate only after the final reviewer status is `PASS`, all required checks have passed, and no debugger finding remains unresolved:
+
+1. Inspect `git status --short`, the current branch, configured remote, staged changes, and the task diff.
+2. Exclude unrelated user changes and coordination artifacts under `.herdr/` unless the user explicitly requested them in version control.
+3. Stage only the files belonging to the approved task; do not use a broad add command when unrelated changes may exist.
+4. Create a clear commit and verify its full SHA and contents.
+5. For an authorized push mode, push the task branch without force.
+6. For `push-and-pr`, create the pull request only after the push succeeds.
+7. Write the verified outcome to `.herdr/PUBLISH.md`.
+
+Do not deliver when review says `FIX_REQUIRED`, tests are failing, the branch or remote is ambiguous, unrelated changes cannot be separated, authorization is missing, or the operation would require force push or history rewriting. Stop and ask for direction instead.
 
 ## Shared-state safety
 
@@ -156,6 +214,7 @@ The planner's final response should state:
 - the verification commands and results;
 - the final review status (`PASS` or unresolved `FIX_REQUIRED` findings);
 - the debugger diagnosis and post-repair evidence, if that branch was triggered;
+- the Git delivery mode, branch, commit SHA, push result, and pull-request URL when applicable;
 - any pre-existing failures, assumptions, or follow-up work.
 
 Do not report success merely because all agents reached `idle` or `done`; those states only mean the agents are ready for input.
