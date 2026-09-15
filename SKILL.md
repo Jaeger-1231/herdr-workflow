@@ -1,6 +1,6 @@
 ---
 name: herdr-workflow
-description: "Coordinate a sequential planner-coder-reviewer coding workflow with conditional debugging, eight-minute coder progress reports, and an optional reviewed Git delivery step inside Herdr. Use when the user explicitly asks to orchestrate multiple coding agents in one Herdr workspace."
+description: "Coordinate a sequential planner-coder-reviewer coding workflow with selectable quiet or eight-minute coder progress, conditional debugging, and an optional reviewed Git delivery step inside Herdr. Use when the user explicitly asks to orchestrate multiple coding agents in one Herdr workspace."
 ---
 
 # Herdr coding workflow
@@ -23,8 +23,8 @@ Use the installed `/herdr` skill for Herdr command semantics. The workflow assum
 
 Every participating agent must be assigned one explicit role in its startup prompt or agent name:
 
-- `planner`: owns orchestration, creates the plan, dispatches the other agents, decides whether another loop is needed, presents coder progress checkpoints to the user, performs any authorized Git delivery, and reports the final result. The planner may be a Codex agent with access to the `/herdr` skill.
-- `coder`: reads the plan, changes source and tests, runs the relevant checks, records structured progress checkpoints, and reports evidence. It does not dispatch other agents or rewrite the plan unless the planner explicitly asks.
+- `planner`: owns orchestration, creates the plan, asks the user to select the coder progress mode, dispatches the other agents, decides whether another loop is needed, presents requested coder progress checkpoints, performs any authorized Git delivery, and reports the final result. The planner may be a Codex agent with access to the `/herdr` skill.
+- `coder`: reads the plan, changes source and tests, runs the relevant checks, records structured progress checkpoints when `progress-8m` is selected, and reports evidence. It does not dispatch other agents or rewrite the plan unless the planner explicitly asks.
 - `reviewer`: reviews the plan, diff, tests, and relevant behavior without changing business code. It writes a structured review result and identifies concrete fixes.
 - `debugger`: is started only when the conditional debugging branch is triggered. It diagnoses persistent failures and writes evidence-backed repair guidance without changing source code or tests.
 
@@ -41,9 +41,10 @@ The planner writes `.herdr/PLAN.md` before implementation. It should contain:
 3. files or components expected to change;
 4. implementation and verification steps;
 5. unresolved assumptions or questions;
-6. the Git delivery mode, remote, and target branch when delivery is in scope.
+6. the selected coder progress mode (`quiet` or `progress-8m`);
+7. the Git delivery mode, remote, and target branch when delivery is in scope.
 
-During every coder work period, the coder maintains `.herdr/PROGRESS.md`. Each checkpoint replaces the previous checkpoint and includes a timestamp plus:
+In `progress-8m` mode, the coder maintains `.herdr/PROGRESS.md` during every coder work period. Each checkpoint replaces the previous checkpoint and includes a timestamp plus:
 
 1. work completed since the previous checkpoint;
 2. the problem currently being solved;
@@ -51,7 +52,7 @@ During every coder work period, the coder maintains `.herdr/PROGRESS.md`. Each c
 4. blockers or decisions needed;
 5. the most recent relevant command and result, when available.
 
-The coder writes an initial checkpoint when it starts and refreshes it at material phase changes. While it remains active, no more than eight minutes should pass between checkpoints. A long foreground command may delay a checkpoint; in that case the next checkpoint must identify the command and its outcome.
+The coder writes an initial checkpoint when it starts and refreshes it at material phase changes. While it remains active, no more than eight minutes should pass between checkpoints. A long foreground command may delay a checkpoint; in that case the next checkpoint must identify the command and its outcome. In `quiet` mode, do not require periodic checkpoints or create planner wake-ups solely for progress reporting.
 
 The coder reads `.herdr/PLAN.md`, implements the requested change, runs the appropriate tests or checks, and leaves the working tree and test evidence available for review. It must not claim success without reporting the commands it ran and their outcomes.
 
@@ -90,7 +91,23 @@ Start agents with the model and provider arguments requested by the user. Herdr 
 The normal sequence is:
 
 1. Planner inspects the repository and writes `.herdr/PLAN.md`.
-2. Planner prompts `coder` with the progress contract and starts the first eight-minute wait window:
+2. Immediately before the first coder dispatch, planner asks the user to choose one of these modes unless the user already selected one in the current request:
+
+   - `quiet` (default and recommended): no periodic report; resume planner only when coder settles or becomes blocked.
+   - `progress-8m`: while coder is active, present one structured progress report every eight minutes.
+
+   Do not dispatch coder until the selection is known. Record it in `.herdr/PLAN.md` and reuse it for later coder fix tasks unless the user changes it.
+3. Planner prompts `coder` according to the selected mode.
+
+   For `quiet`:
+
+   ```bash
+   herdr agent prompt coder \
+     "Read .herdr/PLAN.md. Implement the requested change, run the relevant checks, and report exact final evidence. Do not dispatch other agents." \
+     --wait
+   ```
+
+   For `progress-8m`:
 
    ```bash
    herdr agent prompt coder \
@@ -100,7 +117,7 @@ The normal sequence is:
 
    If the command times out while the coder is still working, the planner handles a progress checkpoint as described below and then continues with `agent wait coder --timeout 480000`. The timeout ends only the wait; it does not cancel the coder.
 
-3. Planner checks the coder's reported verification. If the relevant checks pass, it prompts `reviewer` and waits:
+4. Planner checks the coder's reported verification. If the relevant checks pass, it prompts `reviewer` and waits:
 
    ```bash
    herdr agent prompt reviewer \
@@ -108,9 +125,9 @@ The normal sequence is:
      --wait
    ```
 
-4. Planner reads `.herdr/REVIEW.md`. If it says `FIX_REQUIRED`, it gives the findings to `coder`, waits for the fix and tests, then asks `reviewer` to review again.
-5. Use at most two fix-review iterations by default. If the reviewer still reports `FIX_REQUIRED`, stop and report the remaining findings rather than looping indefinitely.
-6. If an agent is `blocked`, inspect its state and output before sending keys or answering. Do not blindly resubmit a timed-out prompt.
+5. Planner reads `.herdr/REVIEW.md`. If it says `FIX_REQUIRED`, it gives the findings to `coder`, waits for the fix and tests, then asks `reviewer` to review again.
+6. Use at most two fix-review iterations by default. If the reviewer still reports `FIX_REQUIRED`, stop and report the remaining findings rather than looping indefinitely.
+7. If an agent is `blocked`, inspect its state and output before sending keys or answering. Do not blindly resubmit a timed-out prompt.
 
 ### Conditional debugging
 
@@ -132,9 +149,11 @@ When triggered:
 
 Use at most one debugger-diagnosis/fix cycle by default. Do not alternate indefinitely between coder and debugger.
 
-### Eight-minute coder progress
+### Coder progress modes
 
-This is an intentional exception to the no-polling normal path and applies only while the coder is actively working. Use it for the initial implementation and for later coder repair tasks.
+`quiet` is the low-cost default. Use one foreground `agent prompt --wait` or `agent wait` call without a scheduled progress timeout. The planner remains suspended until coder settles; do not read `.herdr/PROGRESS.md` or generate periodic user updates.
+
+`progress-8m` is an intentional exception to the no-polling normal path and applies only while the coder is actively working. Use it for the initial implementation and later coder repair tasks after the user selects it.
 
 At each 480-second timeout:
 
@@ -164,7 +183,7 @@ The planner may end the turn before the workflow settles only when the target is
 
 ### Efficient waiting and recovery
 
-For reviewer and debugger tasks, treat a successful `agent prompt --wait` call as the normal synchronization boundary. Herdr submits the prompt with Enter and waits for a settled lifecycle state, so the planner should not build a polling loop around those roles. Coder tasks use only the explicit eight-minute progress windows above.
+For reviewer, debugger, and `quiet` coder tasks, treat a successful `agent prompt --wait` call as the normal synchronization boundary. Herdr submits the prompt with Enter and waits for a settled lifecycle state, so the planner should not build a polling loop around those roles. Only `progress-8m` coder tasks use explicit eight-minute progress windows.
 
 Outside the coder progress protocol:
 
@@ -174,7 +193,7 @@ Outside the coder progress protocol:
 4. When the target reaches `idle` or `done`, collect its semantic result once. Prefer the required handoff artifact; if the result exists only in the transcript, perform one appropriately sized `agent read`. Do not pair that read with a redundant status query.
 5. When the target reaches `blocked`, inspect the blocking UI once and stop for any user decision or authorization that is required. Do not answer approvals or questions by guessing.
 
-A 480-second timeout produced by the coder progress protocol is a scheduled checkpoint, not an infrastructure error. Other timeouts use the recovery rules below.
+A 480-second timeout produced in `progress-8m` mode is a scheduled checkpoint, not an infrastructure error. Other timeouts use the recovery rules below.
 
 Use recovery checks only after an actual exceptional result:
 
