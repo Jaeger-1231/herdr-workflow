@@ -14,6 +14,7 @@
 - 以实际 diff、测试命令和输出作为完成证据；
 - 只在持续失败时启动 debugger，避免无意义的额外调用；
 - 使用 Herdr 的生命周期等待能力，并提供低开销静默等待与每 8 分钟进度两种模式；
+- 为 coder 提供统一的线性、命令式、研究脚本式代码规范，并在初次实现、review 修复和 debugger 修复时复用同一规范源；
 - 只在最终审查通过后执行经过明确授权的 Git 交付；
 - 限制修复循环次数，避免 Agent 在同一问题上无限往返。
 
@@ -72,8 +73,8 @@ coder 持续失败 → debugger 诊断 → coder 修复 → reviewer
 | 角色 | 主要职责 | 是否修改业务代码 |
 |---|---|---:|
 | `planner` | 检查仓库、询问进度模式、编写计划、分派任务、按模式展示进度、判断修复或调试分支、执行授权的 Git 交付、汇总结果 | 原则上不修改业务代码 |
-| `coder` | 根据计划实现功能、修改测试、运行检查，并在 `progress-8m` 模式下维护进度文件 | 是 |
-| `reviewer` | 检查计划、diff、测试证据和行为，输出结构化审查结论 | 否 |
+| `coder` | 先读取计划和 `references/coder-style.md`，根据计划实现功能、修改测试、运行检查，并在 `progress-8m` 模式下维护进度文件 | 是 |
+| `reviewer` | 读取 `references/coder-style.md`，检查计划、diff、测试证据、行为以及重要的代码风格违约，输出结构化审查结论 | 否 |
 | `debugger` | 对持续失败进行根因诊断，提出最小修复和验证方法 | 否 |
 
 角色必须在 Agent 名称或启动提示中明确指定，不能仅根据模型名称推断职责。
@@ -94,6 +95,20 @@ coder 持续失败 → debugger 诊断 → coder 修复 → reviewer
 `DEBUG.md` 仅在条件式调试被触发时出现；`PUBLISH.md` 仅在 Git 交付成功后出现。
 
 除非用户明确要求，否则不要修改项目的 `.gitignore` 或其他仓库配置来处理这些文件。
+
+### Coder implementation style
+
+统一的 coder 规范位于 [`references/coder-style.md`](./references/coder-style.md)。planner 必须确保 planner、coder 和 reviewer 都加载这个 Skill；否则不能假定目标 Agent 能访问该 reference。满足这一前提时，coder 应直接读取该 reference 的完整内容；不需要也不应在每个项目中复制一份 `.herdr/CODER.md`。
+
+在以下每个 coder work period 开始前，都必须重新读取该文件：
+
+1. 初次实现；
+2. reviewer 要求的修复；
+3. debugger 诊断后的修复。
+
+如果 coder 的工作上下文不完整、不确定或疑似经过压缩，应重新读取 `references/coder-style.md` 和 `.herdr/PLAN.md` 后再继续。上下文压缩本身不保证 Agent 会重新从磁盘读取文件。
+
+reviewer 也必须在审查 coder 修改前读取该 reference，并在影响可读性、可维护性或研究脚本工作流时报告重要的风格违约。该规范不能覆盖用户、仓库或语言本身的明确约束；直接冲突应由 planner 写入 `.herdr/PLAN.md` 解决。
 
 ### PLAN.md
 
@@ -194,7 +209,7 @@ planner 检查：
 
 ```bash
 herdr agent prompt coder \
-  "Read .herdr/PLAN.md. Implement the requested change, run the relevant checks, and report exact final evidence. Do not dispatch other agents." \
+  "Read .herdr/PLAN.md and read the complete references/coder-style.md file from this skill before making any source-code or test changes. Follow that style throughout this coder work period. Implement the requested change, run the relevant checks, and report exact final evidence. Do not dispatch other agents." \
   --wait
 ```
 
@@ -204,7 +219,7 @@ planner 使用一次带 `--wait` 的提示提交任务：
 
 ```bash
 herdr agent prompt coder \
-  "Read .herdr/PLAN.md. Implement the requested change and run the relevant checks. Maintain .herdr/PROGRESS.md with a timestamp, completed work, current problem, next action, blockers, and the latest relevant command/result; refresh it at material phase changes and at least every eight minutes while active. Report exact final evidence. Do not dispatch other agents." \
+  "Read .herdr/PLAN.md and read the complete references/coder-style.md file from this skill before making any source-code or test changes. Follow that style throughout this coder work period. Implement the requested change and run the relevant checks. Maintain .herdr/PROGRESS.md with a timestamp, completed work, current problem, next action, blockers, and the latest relevant command/result; refresh it at material phase changes and at least every eight minutes while active. Report exact final evidence. Do not dispatch other agents." \
   --wait --timeout 480000
 ```
 
@@ -235,11 +250,11 @@ herdr agent wait coder --timeout 480000
 
 ```bash
 herdr agent prompt reviewer \
-  "Read .herdr/PLAN.md, inspect the current diff and test evidence, and write .herdr/REVIEW.md. Do not modify business code. The first non-empty line must be PASS or FIX_REQUIRED." \
+  "Read .herdr/PLAN.md and the complete references/coder-style.md file from this skill. Inspect the current diff and test evidence for correctness and material violations of the coder style contract, then write .herdr/REVIEW.md. Do not modify business code. The first non-empty line must be PASS or FIX_REQUIRED." \
   --wait
 ```
 
-如果结果为 `FIX_REQUIRED`，planner 将具体发现交回 coder。默认最多执行两轮 fix-review。
+如果结果为 `FIX_REQUIRED`，planner 将具体发现交回 coder，并要求 coder 在编辑前重新读取 `.herdr/PLAN.md` 和完整的 `references/coder-style.md`。默认最多执行两轮 fix-review。
 
 ## 条件式 Debugger
 
@@ -262,7 +277,13 @@ herdr agent prompt debugger \
   --wait
 ```
 
-planner 检查 `.herdr/DEBUG.md` 是否提供了可验证的诊断，然后只让 coder 执行一次基于诊断的修复。
+planner 检查 `.herdr/DEBUG.md` 是否提供了可验证的诊断，然后只让 coder 执行一次基于诊断的修复。修复提示必须要求 coder 先重新读取 `.herdr/PLAN.md` 和完整的 `references/coder-style.md`。
+
+```bash
+herdr agent prompt coder \
+  "Re-read .herdr/PLAN.md and the complete references/coder-style.md file from this skill before editing. Apply the actionable diagnosis in .herdr/DEBUG.md, run the specified verification, and report exact evidence. Do not dispatch other agents." \
+  --wait
+```
 
 默认最多一轮 debugger-diagnosis/fix：
 

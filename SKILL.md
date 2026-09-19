@@ -24,11 +24,36 @@ Use the installed `/herdr` skill for Herdr command semantics. The workflow assum
 Every participating agent must be assigned one explicit role in its startup prompt or agent name:
 
 - `planner`: owns orchestration, creates the plan, asks the user to select the coder progress mode, dispatches the other agents, decides whether another loop is needed, presents requested coder progress checkpoints, performs any authorized Git delivery, and reports the final result. The planner may be a Codex agent with access to the `/herdr` skill.
-- `coder`: reads the plan, changes source and tests, runs the relevant checks, records structured progress checkpoints when `progress-8m` is selected, and reports evidence. It does not dispatch other agents or rewrite the plan unless the planner explicitly asks.
-- `reviewer`: reviews the plan, diff, tests, and relevant behavior without changing business code. It writes a structured review result and identifies concrete fixes.
+- `coder`: reads the plan and the complete `references/coder-style.md` file from this skill before changing source code or tests, follows that style throughout the work period, runs the relevant checks, records structured progress checkpoints when `progress-8m` is selected, and reports evidence. It does not dispatch other agents or rewrite the plan unless the planner explicitly asks.
+- `reviewer`: reads the plan, the complete `references/coder-style.md` file from this skill, the diff, tests, and relevant behavior without changing business code. It writes a structured review result and identifies concrete fixes, including material violations of the coder style contract when they affect readability or the requested research workflow.
 - `debugger`: is started only when the conditional debugging branch is triggered. It diagnoses persistent failures and writes evidence-backed repair guidance without changing source code or tests.
 
 Do not infer a role from the model name alone. If the role is ambiguous, ask the user or establish it before dispatching work.
+
+## Coder implementation style
+
+Every participating agent is expected to load this skill, and the planner must
+ensure that condition before dispatching it. The implementation style is kept
+in [`references/coder-style.md`](references/coder-style.md), which is the single
+source of truth for coder-authored code. A coder must read that reference
+completely before making any source-code or test changes and follow it
+throughout every coder work period, including initial implementation, reviewer
+fixes, and debugger-guided repairs. If a target agent cannot load this skill,
+do not assume that it can access this reference; stop and report the handoff
+problem instead.
+
+If the coder's working context becomes incomplete, uncertain, or appears to
+have been compressed, it must re-read `references/coder-style.md` and
+`.herdr/PLAN.md` before continuing. Context compression does not itself
+guarantee that files are read again. Do not duplicate this reference into
+`.herdr/`; `.herdr/` is reserved for task-specific handoff state unless the user
+explicitly requests another arrangement.
+
+The reviewer must also read the reference before reviewing coder-authored
+changes and should report material style violations when they harm readability,
+maintainability, or the requested research-script workflow. The style contract
+does not override explicit user, repository, or language constraints; resolve a
+direct conflict in `.herdr/PLAN.md`.
 
 ## Handoff protocol
 
@@ -54,7 +79,11 @@ In `progress-8m` mode, the coder maintains `.herdr/PROGRESS.md` during every cod
 
 The coder writes an initial checkpoint when it starts and refreshes it at material phase changes. While it remains active, no more than eight minutes should pass between checkpoints. A long foreground command may delay a checkpoint; in that case the next checkpoint must identify the command and its outcome. In `quiet` mode, do not require periodic checkpoints or create planner wake-ups solely for progress reporting.
 
-The coder reads `.herdr/PLAN.md`, implements the requested change, runs the appropriate tests or checks, and leaves the working tree and test evidence available for review. It must not claim success without reporting the commands it ran and their outcomes.
+The coder reads `.herdr/PLAN.md` and the complete `references/coder-style.md`
+file from this skill before implementing the requested change, runs the
+appropriate tests or checks, and leaves the working tree and test evidence
+available for review. It must not claim success without reporting the commands
+it ran and their outcomes.
 
 When conditional debugging is triggered, the debugger reads `.herdr/PLAN.md`, the current diff, the failing command and output, and the coder's prior repair evidence. It writes `.herdr/DEBUG.md` containing:
 
@@ -103,7 +132,7 @@ The normal sequence is:
 
    ```bash
    herdr agent prompt coder \
-     "Read .herdr/PLAN.md. Implement the requested change, run the relevant checks, and report exact final evidence. Do not dispatch other agents." \
+     "Read .herdr/PLAN.md and read the complete references/coder-style.md file from this skill before making any source-code or test changes. Follow that style throughout this coder work period. Implement the requested change, run the relevant checks, and report exact final evidence. Do not dispatch other agents." \
      --wait
    ```
 
@@ -111,7 +140,7 @@ The normal sequence is:
 
    ```bash
    herdr agent prompt coder \
-     "Read .herdr/PLAN.md. Implement the requested change and run the relevant checks. Maintain .herdr/PROGRESS.md with a timestamp, completed work, current problem, next action, blockers, and the latest relevant command/result; refresh it at material phase changes and at least every eight minutes while active. Report exact final evidence. Do not dispatch other agents." \
+     "Read .herdr/PLAN.md and read the complete references/coder-style.md file from this skill before making any source-code or test changes. Follow that style throughout this coder work period. Implement the requested change and run the relevant checks. Maintain .herdr/PROGRESS.md with a timestamp, completed work, current problem, next action, blockers, and the latest relevant command/result; refresh it at material phase changes and at least every eight minutes while active. Report exact final evidence. Do not dispatch other agents." \
      --wait --timeout 480000
    ```
 
@@ -121,11 +150,19 @@ The normal sequence is:
 
    ```bash
    herdr agent prompt reviewer \
-     "Read .herdr/PLAN.md, inspect the current diff and test evidence, and write .herdr/REVIEW.md. Do not modify business code. The first non-empty line must be PASS or FIX_REQUIRED." \
+     "Read .herdr/PLAN.md and the complete references/coder-style.md file from this skill. Inspect the current diff and test evidence for correctness and material violations of the coder style contract, then write .herdr/REVIEW.md. Do not modify business code. The first non-empty line must be PASS or FIX_REQUIRED." \
      --wait
    ```
 
-5. Planner reads `.herdr/REVIEW.md`. If it says `FIX_REQUIRED`, it gives the findings to `coder`, waits for the fix and tests, then asks `reviewer` to review again.
+5. Planner reads `.herdr/REVIEW.md`. If it says `FIX_REQUIRED`, it gives the findings to `coder` with an explicit instruction to re-read `.herdr/PLAN.md` and the complete `references/coder-style.md` file before editing, waits for the fix and tests, then asks `reviewer` to review again.
+
+   A review-fix prompt should have this shape:
+
+   ```bash
+   herdr agent prompt coder \
+     "Re-read .herdr/PLAN.md and the complete references/coder-style.md file from this skill before editing. Apply the concrete findings in .herdr/REVIEW.md, run the relevant checks, and report exact final evidence. Do not dispatch other agents." \
+     --wait
+   ```
 6. Use at most two fix-review iterations by default. If the reviewer still reports `FIX_REQUIRED`, stop and report the remaining findings rather than looping indefinitely.
 7. If an agent is `blocked`, inspect its state and output before sending keys or answering. Do not blindly resubmit a timed-out prompt.
 
@@ -144,7 +181,13 @@ When triggered:
    ```
 
 2. Validate that `.herdr/DEBUG.md` addresses the observed failure. If it lacks a reproducible hypothesis or actionable verification, stop and report the unresolved diagnosis rather than asking the coder to guess.
-3. Prompt `coder` once to apply the diagnosis, run the specified verification, and report exact evidence.
+3. Prompt `coder` once to re-read `.herdr/PLAN.md` and the complete `references/coder-style.md` file from this skill, apply the diagnosis, run the specified verification, and report exact evidence:
+
+   ```bash
+   herdr agent prompt coder \
+     "Re-read .herdr/PLAN.md and the complete references/coder-style.md file from this skill before editing. Apply the actionable diagnosis in .herdr/DEBUG.md, run the specified verification, and report exact evidence. Do not dispatch other agents." \
+     --wait
+   ```
 4. If the relevant checks pass, continue to reviewer. If the same failure remains, stop and report the diagnosis and evidence.
 
 Use at most one debugger-diagnosis/fix cycle by default. Do not alternate indefinitely between coder and debugger.
